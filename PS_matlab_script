@@ -1,0 +1,519 @@
+%% ========================================================================
+%  Koç University | Chemical Engineering
+%  Process Systems Engineering (PSE) Project
+%
+%  Project Title : Reproduction & Improvement of District Heating MILP (STS)
+%  Case Study    : One-Producer Benchmark (Topotherm dataset)
+%  Student Name  : Yahya MUYODI
+%  Department    : Chemical Engineering (PhD)
+%  Course        : Process Systems Engineering
+%  Instructor    : [Enter Instructor Name]
+%  Semester      : [Enter Term]
+%  Date          : [Enter Date]
+%
+%  Script Name   : run_STS_one_producer.m
+%  Purpose       : Reproduce the STS single-time-step MILP using your CSVs:
+%                  A_i, A_c, A_p, L_i, Q_c, regression, flh_sinks/sources,
+%                  positions (optional for plots).
+%
+%  Folder Layout (recommended):
+%     Process_Systems_Project/
+%       data/one-producer/*.csv
+%       matlab_project/run_STS_one_producer.m
+%       results/
+%
+%  Requirements  : MATLAB + Optimization Toolbox (intlinprog)
+%
+%  How to Run    : Open this file in MATLAB and press Run.
+% ========================================================================
+
+clear; clc;
+
+%% -------------------------
+%  0) Project paths
+% -------------------------
+thisFile = mfilename("fullpath");
+thisDir  = fileparts(thisFile);
+
+projectRoot = find_project_root(thisDir);   % robust (walks upward)
+dataDir     = fullfile(projectRoot, "data", "one-producer");
+resultsDir  = fullfile(projectRoot, "results");
+
+if ~isfolder(dataDir)
+    error("Data directory not found: %s", dataDir);
+end
+if ~isfolder(resultsDir), mkdir(resultsDir); end
+
+fprintf("Using projectRoot= %s\n", projectRoot);
+fprintf("Using dataDir    = %s\n", dataDir);
+fprintf("Using resultsDir = %s\n\n", resultsDir);
+
+%% -------------------------
+%  1) Load incidence matrices (with labels)
+% -------------------------
+AiT = readtable(fullfile(dataDir,"A_i.csv"), "ReadRowNames", true);
+AcT = readtable(fullfile(dataDir,"A_c.csv"), "ReadRowNames", true);
+ApT = readtable(fullfile(dataDir,"A_p.csv"), "ReadRowNames", true);
+
+Ai = sparse(table2array(AiT));   % N x E  (incidence)
+Ac = sparse(table2array(AcT));   % N x C  (consumer-to-node)
+Ap = sparse(table2array(ApT));   % N x P  (producer-to-node)
+
+nodeNames = string(AiT.Properties.RowNames);
+edgeNames = string(AiT.Properties.VariableNames);
+consNames = string(AcT.Properties.VariableNames);
+prodNames = string(ApT.Properties.VariableNames);
+
+N = size(Ai,1); E = size(Ai,2); C = size(Ac,2); P = size(Ap,2);
+
+fprintf("Loaded: N=%d nodes, E=%d internal edges, C=%d consumers, P=%d producers\n", N, E, C, P);
+
+%% -------------------------
+%  2) Pipe lengths L_i (meters), aligned to edges in A_i
+% -------------------------
+LiT = readtable(fullfile(dataDir,"L_i.csv"), "PreserveVariableNames", true);
+
+% Expect columns: index, length_in_m
+[tfL, locL] = ismember(edgeNames, string(LiT.index));
+if ~all(tfL)
+    missing = edgeNames(~tfL);
+    error("Some edges in A_i are missing from L_i.csv, e.g. %s", missing(1));
+end
+l = LiT.length_in_m(locL);   % E x 1
+
+%% -------------------------
+%  3) Full-load hours (FLH): sinks + sources (scalar expected)
+% -------------------------
+flh_sink = read_flh_scalar(fullfile(dataDir, "flh_sinks.csv"));
+flh_src  = read_flh_scalar(fullfile(dataDir, "flh_sources.csv"));
+
+fprintf("FLH: sink=%g h, source=%g h\n", flh_sink, flh_src);
+
+%% -------------------------
+%  4) Regression coefficients
+% -------------------------
+regT = readtable(fullfile(dataDir,"regression.csv"), "PreserveVariableNames", true);
+
+a_therm = regT.heat_loss_a(1);
+b_therm = regT.heat_loss_b(1);
+a_cost  = regT.capacity_a(1);
+b_cost  = regT.capacity_b(1);
+Qmax    = regT.power_flow_max_kW(1);
+
+fprintf("Regression: a_therm=%g, b_therm=%g, a_cost=%g, b_cost=%g, Qmax=%g kW\n", ...
+    a_therm, b_therm, a_cost, b_cost, Qmax);
+
+%% -------------------------
+%  5) Consumer demand Q_c (kWh/yr) -> peak-equivalent kW
+% -------------------------
+QcT = readtable(fullfile(dataDir,"Q_c.csv"), "ReadRowNames", true, "PreserveVariableNames", true);
+
+% Expect column: heat_demand_kwh
+if ~ismember("heat_demand_kwh", string(QcT.Properties.VariableNames))
+    error("Q_c.csv must contain column 'heat_demand_kwh'.");
+end
+
+% Consumer labels in A_c are variable names. Q_c row names should match those labels.
+[tfC, locC] = ismember(consNames, string(QcT.Properties.RowNames));
+if ~all(tfC)
+    missing = consNames(~tfC);
+    error("Some consumers in A_c are missing from Q_c.csv rownames, e.g. %s", missing(1));
+end
+
+Qc_kWh = QcT.heat_demand_kwh(locC);
+Qc_peak_kW = Qc_kWh ./ flh_sink;
+
+% Nodal demand vector (N x 1): Ac * Qc_peak_kW (sign may vary by dataset)
+D0 = Ac * Qc_peak_kW;
+
+fprintf("Total annual demand  = %.3f MWh\n", sum(Qc_kWh)/1000);
+fprintf("Total peak-equivalent= %.3f kW\n\n", sum(Qc_peak_kW));
+
+%% -------------------------
+%  6) Reverse-edge pairing (optional constraint)
+% -------------------------
+% Build tail/head index for BOTH conventions (we'll choose later)
+% Convention A: tail=-1, head=+1
+tailIdxA = zeros(E,1); headIdxA = zeros(E,1);
+% Convention B: tail=+1, head=-1
+tailIdxB = zeros(E,1); headIdxB = zeros(E,1);
+
+for e = 1:E
+    col = Ai(:,e);
+    tA = find(col==-1); hA = find(col== 1);
+    tB = find(col== 1); hB = find(col==-1);
+
+    if isempty(tA) || isempty(hA) || isempty(tB) || isempty(hB)
+        error("Edge %s does not have exactly one +1 and one -1 in A_i.", edgeNames(e));
+    end
+
+    tailIdxA(e) = tA(1); headIdxA(e) = hA(1);
+    tailIdxB(e) = tB(1); headIdxB(e) = hB(1);
+end
+
+% Pairing based on Convention A indices (pairing doesn't depend on chosen sign in practice)
+key    = tailIdxA*1e7 + headIdxA;
+revKey = headIdxA*1e7 + tailIdxA;
+[tfR, revPos] = ismember(revKey, key);
+
+pairMask = tfR & ((1:E)' < revPos);
+pairs = [find(pairMask)  revPos(pairMask)];
+fprintf("Detected %d reverse edge pairs.\n\n", size(pairs,1));
+
+%% -------------------------
+%  7) Define decision variables x = [Qin; Qout; Qp; lam]
+% -------------------------
+nQin = E; nQout = E; nQp = P; nLam = E;
+nVar = nQin + nQout + nQp + nLam;
+
+idxQin  = 1:nQin;
+idxQout = nQin + (1:nQout);
+idxQp   = nQin + nQout + (1:nQp);
+idxLam  = nQin + nQout + nQp + (1:nLam);
+
+lb = zeros(nVar,1);
+ub = inf(nVar,1);
+
+% lam binary
+lb(idxLam) = 0;
+ub(idxLam) = 1;
+intcon     = idxLam;
+
+%% -------------------------
+%  8) Auto-detect sign convention (incidence, producer sign, demand sign)
+%      We test feasibility of the LP relaxation first (fast, robust):
+%      Constraints include:
+%        (pipe): (1-a*l)Qin - Qout - (b*l)lam = 0
+%        (node): Ai_tail*Qin - Ai_head*Qout + sAp*Ap*Qp = sD*D0
+%        (bigM): Qin <= Qmax*lam
+%        bounds: Qin,Qout,Qp >=0, 0<=lam<=1
+% -------------------------
+Ai_tail_A = sparse(Ai==-1);  Ai_head_A = sparse(Ai== 1);
+Ai_tail_B = sparse(Ai== 1);  Ai_head_B = sparse(Ai==-1);
+
+optsLPtest = optimoptions('linprog','Display','none');
+
+best = struct("ok",false,"Ai_tail",[],"Ai_head",[],"sAp",1,"sD",1);
+
+for s = 1:2
+    if s==1
+        Ai_tail = Ai_tail_A; Ai_head = Ai_head_A;
+        labelInc = "tail=-1, head=+1";
+    else
+        Ai_tail = Ai_tail_B; Ai_head = Ai_head_B;
+        labelInc = "tail=+1, head=-1";
+    end
+
+    for sAp = [-1, +1]
+        for sD = [-1, +1]
+            [Aeq_try, beq_try, Aineq_try, bineq_try] = build_constraints( ...
+                Ai_tail, Ai_head, Ap, D0, sAp, sD, ...
+                a_therm, b_therm, l, Qmax, ...
+                E, N, nVar, idxQin, idxQout, idxQp, idxLam, pairs);
+
+            zeroObj = zeros(nVar,1);
+            [x_try,~,ef] = linprog(zeroObj, Aineq_try, bineq_try, Aeq_try, beq_try, lb, ub, optsLPtest);
+
+            if ef == 1 && ~isempty(x_try)
+                best.ok     = true;
+                best.Ai_tail= Ai_tail;
+                best.Ai_head= Ai_head;
+                best.sAp    = sAp;
+                best.sD     = sD;
+
+                fprintf("Feasible sign combo found (LP relax): %s, ApSign=%+d, DSign=%+d\n", labelInc, sAp, sD);
+                break;
+            end
+        end
+        if best.ok, break; end
+    end
+    if best.ok, break; end
+end
+
+if ~best.ok
+    error("No feasible sign combination found even for LP relaxation. Check CSV consistency (A_i/A_c/A_p/L_i/Q_c/regression).");
+end
+fprintf("\nSelected: incidence=%s | node balance uses (%+d)*Ap*Qp = (%+d)*D0\n\n", ...
+    (best.Ai_tail==Ai_tail_A)*"tail=-1,head=+1" + (best.Ai_tail==Ai_tail_B)*"tail=+1,head=-1", ...
+    best.sAp, best.sD);
+
+Ai_tail = best.Ai_tail;
+Ai_head = best.Ai_head;
+D       = best.sD * D0;
+Ap_use  = best.sAp * Ap;
+
+%% -------------------------
+%  9) Build final MILP constraints (correct STS form)
+% -------------------------
+[Aeq, beq, Aineq, bineq] = build_constraints( ...
+    Ai_tail, Ai_head, Ap_use, D, +1, +1, ...  % signs already applied, keep +1 here
+    a_therm, b_therm, l, Qmax, ...
+    E, N, nVar, idxQin, idxQout, idxQp, idxLam, pairs);
+
+%% -------------------------
+% 10) Objective (baseline linear)
+% -------------------------
+% Producer OPEX: c_fuel (€/kWh) * (Qp[kW] * FLH[h])
+c_fuel = 0.08;
+
+c = zeros(nVar,1);
+c(idxQp) = c_fuel * flh_src;
+
+% Pipe CAPEX surrogate (as in your CSV regression)
+c(idxQin) = c(idxQin) + a_cost * l;
+c(idxLam) = c(idxLam) + b_cost * l;
+
+%% -------------------------
+% 11) Solve MILP (intlinprog)
+% -------------------------
+optsMILP = optimoptions('intlinprog', ...
+    'Display','iter');   % keep clean, avoid legacy warnings
+
+fprintf("--- Solving MILP with intlinprog ---\n");
+[x,fval,exitflag,output] = intlinprog(c, intcon, Aineq, bineq, Aeq, beq, lb, ub, optsMILP);
+
+fprintf("\nexitflag = %d\n", exitflag);
+disp(output);
+
+if exitflag <= 0 || isempty(x)
+    fprintf("\n*** No feasible solution found (exitflag=%d). ***\n", exitflag);
+    fprintf("Since LP-relax feasibility was OK earlier, this usually means\n");
+    fprintf("something forced lam to be integer-infeasible (rare) OR a mismatch slipped in.\n");
+    fprintf("Next debug step: run LP relaxation with lam continuous using linprog on SAME constraints.\n");
+    return;
+end
+
+fprintf("Objective fval = %.6g\n\n", fval);
+
+%% -------------------------
+% 12) Extract solution
+% -------------------------
+Qin  = x(idxQin);
+Qout = x(idxQout);
+Qp   = x(idxQp);
+lam  = x(idxLam);
+
+%% -------------------------
+% 13) Sanity checks
+% -------------------------
+% Pipe residual (exactly the equality we enforced):
+% (1-a*l)Qin - Qout - (b*l)lam = 0
+resPipe = (1 - a_therm*l).*Qin - Qout - (b_therm*l).*lam;
+
+% Node residual:
+resNode = (Ai_tail*Qin) - (Ai_head*Qout) + (Ap_use*Qp) - D;
+
+fprintf("--- Sanity checks ---\n");
+fprintf("Max |pipe residual| = %.3e\n", max(abs(resPipe)));
+fprintf("Max |node residual| = %.3e\n\n", max(abs(resNode)));
+
+fprintf("--- Summary ---\n");
+fprintf("Active directed edges (sum lam) = %d\n", round(sum(lam)));
+fprintf("Max Qin (kW) = %.3f\n", max(Qin));
+fprintf("Producer output sum(Qp) (kW) = %.3f\n\n", sum(Qp));
+
+%% -------------------------
+% 14) Save key results (CSV)
+% -------------------------
+solEdges = table(edgeNames(:), l(:), Qin(:), Qout(:), lam(:), ...
+    'VariableNames', {'edge','length_m','Qin_kW','Qout_kW','lam'});
+writetable(solEdges, fullfile(resultsDir, "solution_edges.csv"));
+
+solProd = table(prodNames(:), Qp(:), 'VariableNames', {'producer','Qp_kW'});
+writetable(solProd, fullfile(resultsDir, "solution_producer.csv"});
+
+fprintf("Saved:\n  %s\n  %s\n\n", ...
+    fullfile(resultsDir, "solution_edges.csv"), fullfile(resultsDir, "solution_producer.csv"));
+
+%% -------------------------
+% 15) Top-10 edges by Qin
+% -------------------------
+[~, idxSort] = sort(Qin, 'descend');
+topK = min(10, E);
+fprintf("Top %d Qin edges:\n", topK);
+for k = 1:topK
+    e = idxSort(k);
+    fprintf("%2d) %-8s  Qin=%.3f kW, Qout=%.3f kW, lam=%d, L=%.2f m\n", ...
+        k, edgeNames(e), Qin(e), Qout(e), round(lam(e)), l(e));
+end
+fprintf("\n");
+
+%% -------------------------
+% 16) OPTIONAL: Plot network + selected pipes (requires positions.csv)
+% -------------------------
+posFile = fullfile(dataDir, "positions.csv");
+if isfile(posFile)
+    try
+        posT = readtable(posFile, "PreserveVariableNames", true);
+
+        % Expect: index, node_type, x_rel, y_rel
+        [tfN, locN] = ismember(nodeNames, string(posT.index));
+        if ~all(tfN)
+            fprintf("Warning: positions.csv does not contain all node indices. Plot will use available nodes.\n");
+        end
+
+        xNode = nan(N,1); yNode = nan(N,1);
+        xNode(tfN) = posT.x_rel(locN(tfN));
+        yNode(tfN) = posT.y_rel(locN(tfN));
+
+        % Build tail/head indices for the chosen convention (needed for plotting edges)
+        tailIdx = zeros(E,1);
+        headIdx = zeros(E,1);
+        for e = 1:E
+            col = Ai(:,e);
+            if nnz(Ai_tail(:,e)) > 0
+                % chosen: tail matches Ai_tail
+                tailIdx(e) = find(Ai_tail(:,e), 1, 'first');
+                headIdx(e) = find(Ai_head(:,e), 1, 'first');
+            else
+                % fallback (shouldn't happen)
+                tailIdx(e) = tailIdxA(e);
+                headIdx(e) = headIdxA(e);
+            end
+        end
+
+        fig = figure('Name','STS solution (selected pipes)','Color','w');
+        scatter(xNode, yNode, 8, 'filled'); hold on;
+        title('STS one-producer: selected pipes (lam=1)');
+        xlabel('x\_rel'); ylabel('y\_rel');
+
+        sel = find(lam > 0.5);
+        for kk = 1:numel(sel)
+            e = sel(kk);
+            t = tailIdx(e); h = headIdx(e);
+            if isfinite(xNode(t)) && isfinite(xNode(h))
+                plot([xNode(t) xNode(h)], [yNode(t) yNode(h)], '-', 'LineWidth', 0.8);
+            end
+        end
+        axis equal;
+        grid on;
+
+        saveas(fig, fullfile(resultsDir, "network_selected_pipes.png"));
+        fprintf("Saved plot: %s\n", fullfile(resultsDir, "network_selected_pipes.png"));
+    catch ME
+        fprintf("Plot skipped (positions.csv read/plot error): %s\n", ME.message);
+    end
+else
+    fprintf("positions.csv not found -> skipping network plot.\n");
+end
+
+
+%% ========================================================================
+%                              LOCAL FUNCTIONS
+% ========================================================================
+
+function projectRoot = find_project_root(startDir)
+    % Walk upward until we find a folder that contains BOTH "data" and "matlab_project"
+    root = startDir;
+    maxUp = 20;
+    for k = 1:maxUp
+        if isfolder(fullfile(root,"data")) && isfolder(fullfile(root,"matlab_project"))
+            projectRoot = root;
+            return;
+        end
+        parent = fileparts(root);
+        if strcmp(parent, root)
+            break;
+        end
+        root = parent;
+    end
+    % If not found, fall back to one level up (common case)
+    projectRoot = fileparts(startDir);
+end
+
+function flh = read_flh_scalar(fname)
+    % Robustly read a scalar FLH from a "two-column-ish" csv (index + value),
+    % or a repeated column of the same scalar.
+    if ~isfile(fname)
+        error("Missing file: %s", fname);
+    end
+
+    % Use readtable to survive headers/indices
+    T = readtable(fname, "PreserveVariableNames", true);
+
+    % Collect numeric candidates
+    vals = [];
+    for j = 1:width(T)
+        col = T{:,j};
+        if isnumeric(col) || islogical(col)
+            vals = [vals; col(:)];
+        else
+            % try convert strings
+            if iscellstr(col) || isstring(col)
+                x = str2double(string(col));
+                vals = [vals; x(:)];
+            end
+        end
+    end
+
+    vals = vals(isfinite(vals));
+    if isempty(vals)
+        error("Could not parse numeric FLH from %s", fname);
+    end
+
+    % Many files repeat same scalar (e.g. 2500). Use mode-like rule:
+    % choose the most frequent rounded value.
+    vround = round(vals);
+    u = unique(vround);
+    counts = zeros(size(u));
+    for k = 1:numel(u)
+        counts(k) = sum(vround == u(k));
+    end
+    [~, imax] = max(counts);
+    flh = double(u(imax));
+
+    if ~isfinite(flh) || flh <= 0
+        error("Invalid FLH parsed from %s (value=%g).", fname, flh);
+    end
+end
+
+function [Aeq, beq, Aineq, bineq] = build_constraints( ...
+        Ai_tail, Ai_head, Ap, D0, sAp, sD, ...
+        a_therm, b_therm, l, Qmax, ...
+        E, N, nVar, idxQin, idxQout, idxQp, idxLam, pairs)
+
+    % Apply signs (if caller wants to try combos)
+    D  = sD  * D0;
+    Ap = sAp * Ap;
+
+    % Pipe equalities:
+    % (1-a*l)Qin - Qout - (b*l)lam = 0
+    Aeq_pipe = sparse(E, nVar);
+    beq_pipe = zeros(E,1);
+    Aeq_pipe(:, idxQin)  = spdiags(1 - a_therm*l, 0, E, E);
+    Aeq_pipe(:, idxQout) = -speye(E);
+    Aeq_pipe(:, idxLam)  = spdiags(-b_therm*l, 0, E, E);
+
+    % Node equalities:
+    % Ai_tail*Qin - Ai_head*Qout + Ap*Qp = D
+    Aeq_node = sparse(N, nVar);
+    beq_node = D;
+    Aeq_node(:, idxQin) = Ai_tail;
+    Aeq_node(:, idxQout)= -Ai_head;
+    Aeq_node(:, idxQp)  = Ap;
+
+    Aeq = [Aeq_pipe; Aeq_node];
+    beq = [beq_pipe; beq_node];
+
+    % Big-M: Qin <= Qmax * lam
+    Aineq_M = sparse(E, nVar);
+    bineq_M = zeros(E,1);
+    Aineq_M(:, idxQin) = speye(E);
+    Aineq_M(:, idxLam) = -Qmax*speye(E);
+
+    % Anti-parallel: lam_e + lam_rev <= 1
+    mPair = size(pairs,1);
+    if mPair == 0
+        Aineq_pair = sparse(0,nVar);
+        bineq_pair = zeros(0,1);
+    else
+        rows = repelem((1:mPair)', 2, 1);
+        cols = [idxLam(pairs(:,1)); idxLam(pairs(:,2))];
+        vals = ones(2*mPair,1);
+        Aineq_pair = sparse(rows, cols, vals, mPair, nVar);
+        bineq_pair = ones(mPair,1);
+    end
+
+    Aineq = [Aineq_M; Aineq_pair];
+    bineq = [bineq_M; bineq_pair];
+end
