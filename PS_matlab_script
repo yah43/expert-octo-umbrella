@@ -431,6 +431,17 @@ function flh = read_flh_scalar(fname)
     % Use readtable to survive headers/indices
     T = readtable(fname, "PreserveVariableNames", true);
 
+    % Prefer obvious value columns and ignore index-like columns.
+    varNames = string(T.Properties.VariableNames);
+    isIndexCol = strcmpi(varNames, "index");
+    isValueCol = any(strcmpi(varNames, ["value", "flh", "full_load_hours"]));
+
+    if any(isValueCol)
+        T = T(:, isValueCol);
+    elseif any(isIndexCol)
+        T = T(:, ~isIndexCol);
+    end
+
     % Collect numeric candidates
     vals = [];
     for j = 1:width(T)
@@ -451,16 +462,22 @@ function flh = read_flh_scalar(fname)
         error("Could not parse numeric FLH from %s", fname);
     end
 
-    % Many files repeat same scalar (e.g. 2500). Use mode-like rule:
-    % choose the most frequent rounded value.
-    vround = round(vals);
-    u = unique(vround);
-    counts = zeros(size(u));
-    for k = 1:numel(u)
-        counts(k) = sum(vround == u(k));
+    % If there's a single numeric value, use it directly.
+    if numel(vals) == 1
+        flh = double(vals(1));
+    else
+        % Many files repeat same scalar (e.g. 2500). Use mode-like rule:
+        % choose the most frequent rounded value. Break ties by max value.
+        vround = round(vals);
+        u = unique(vround);
+        counts = zeros(size(u));
+        for k = 1:numel(u)
+            counts(k) = sum(vround == u(k));
+        end
+        maxCount = max(counts);
+        candidates = u(counts == maxCount);
+        flh = double(max(candidates));
     end
-    [~, imax] = max(counts);
-    flh = double(u(imax));
 
     if ~isfinite(flh) || flh <= 0
         error("Invalid FLH parsed from %s (value=%g).", fname, flh);
