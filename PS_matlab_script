@@ -163,13 +163,25 @@ fprintf("Detected %d reverse edge pairs.\n\n", size(pairs,1));
 %% -------------------------
 %  7) Define decision variables x = [Qin; Qout; Qp; lam]
 % -------------------------
+allow_unserved_demand = true;      % set false to enforce strict feasibility
+unserved_penalty_eur_per_kwh = 100; % large penalty to discourage unmet demand
+
 nQin = E; nQout = E; nQp = P; nLam = E;
-nVar = nQin + nQout + nQp + nLam;
+nSlack = 0;
+if allow_unserved_demand
+    nSlack = N;  % node-level unmet demand (kW)
+end
+
+nVar = nQin + nQout + nQp + nLam + nSlack;
 
 idxQin  = 1:nQin;
 idxQout = nQin + (1:nQout);
 idxQp   = nQin + nQout + (1:nQp);
 idxLam  = nQin + nQout + nQp + (1:nLam);
+idxSlack = [];
+if allow_unserved_demand
+    idxSlack = nQin + nQout + nQp + nLam + (1:nSlack);
+end
 
 lb = zeros(nVar,1);
 ub = inf(nVar,1);
@@ -209,7 +221,7 @@ for s = 1:2
             [Aeq_try, beq_try, Aineq_try, bineq_try] = build_constraints( ...
                 Ai_tail, Ai_head, Ap, D0, sAp, sD, ...
                 a_therm, b_therm, l, Qmax, ...
-                E, N, nVar, idxQin, idxQout, idxQp, idxLam, pairs);
+                E, N, nVar, idxQin, idxQout, idxQp, idxLam, idxSlack, pairs, allow_unserved_demand);
 
             zeroObj = zeros(nVar,1);
             [x_try,~,ef] = linprog(zeroObj, Aineq_try, bineq_try, Aeq_try, beq_try, lb, ub, optsLPtest);
@@ -248,7 +260,7 @@ Ap_use  = best.sAp * Ap;
 [Aeq, beq, Aineq, bineq] = build_constraints( ...
     Ai_tail, Ai_head, Ap_use, D, +1, +1, ...  % signs already applied, keep +1 here
     a_therm, b_therm, l, Qmax, ...
-    E, N, nVar, idxQin, idxQout, idxQp, idxLam, pairs);
+    E, N, nVar, idxQin, idxQout, idxQp, idxLam, idxSlack, pairs, allow_unserved_demand);
 
 %% -------------------------
 % 10) Objective (baseline linear)
@@ -262,6 +274,9 @@ c(idxQp) = c_fuel * flh_src;
 % Pipe CAPEX surrogate (as in your CSV regression)
 c(idxQin) = c(idxQin) + a_cost * l;
 c(idxLam) = c(idxLam) + b_cost * l;
+if allow_unserved_demand
+    c(idxSlack) = unserved_penalty_eur_per_kwh * flh_sink;
+end
 
 %% -------------------------
 % 11) Solve MILP (intlinprog)
@@ -292,6 +307,10 @@ Qin  = x(idxQin);
 Qout = x(idxQout);
 Qp   = x(idxQp);
 lam  = x(idxLam);
+slack = [];
+if allow_unserved_demand
+    slack = x(idxSlack);
+end
 
 %% -------------------------
 % 13) Sanity checks
@@ -311,6 +330,10 @@ fprintf("--- Summary ---\n");
 fprintf("Active directed edges (sum lam) = %d\n", round(sum(lam)));
 fprintf("Max Qin (kW) = %.3f\n", max(Qin));
 fprintf("Producer output sum(Qp) (kW) = %.3f\n\n", sum(Qp));
+if allow_unserved_demand
+    fprintf("Unmet demand total (kW) = %.3f\n", sum(slack));
+    fprintf("Unmet demand max (kW) = %.3f\n\n", max(slack));
+end
 
 %% -------------------------
 % 14) Save key results (CSV)
@@ -320,7 +343,7 @@ solEdges = table(edgeNames(:), l(:), Qin(:), Qout(:), lam(:), ...
 writetable(solEdges, fullfile(resultsDir, "solution_edges.csv"));
 
 solProd = table(prodNames(:), Qp(:), 'VariableNames', {'producer','Qp_kW'});
-writetable(solProd, fullfile(resultsDir, "solution_producer.csv"});
+writetable(solProd, fullfile(resultsDir, "solution_producer.csv"));
 
 fprintf("Saved:\n  %s\n  %s\n\n", ...
     fullfile(resultsDir, "solution_edges.csv"), fullfile(resultsDir, "solution_producer.csv"));
@@ -470,7 +493,7 @@ end
 function [Aeq, beq, Aineq, bineq] = build_constraints( ...
         Ai_tail, Ai_head, Ap, D0, sAp, sD, ...
         a_therm, b_therm, l, Qmax, ...
-        E, N, nVar, idxQin, idxQout, idxQp, idxLam, pairs)
+        E, N, nVar, idxQin, idxQout, idxQp, idxLam, idxSlack, pairs, allow_unserved_demand)
 
     % Apply signs (if caller wants to try combos)
     D  = sD  * D0;
@@ -491,6 +514,9 @@ function [Aeq, beq, Aineq, bineq] = build_constraints( ...
     Aeq_node(:, idxQin) = Ai_tail;
     Aeq_node(:, idxQout)= -Ai_head;
     Aeq_node(:, idxQp)  = Ap;
+    if allow_unserved_demand
+        Aeq_node(:, idxSlack) = speye(N);
+    end
 
     Aeq = [Aeq_pipe; Aeq_node];
     beq = [beq_pipe; beq_node];
